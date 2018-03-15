@@ -95,7 +95,7 @@ dequeue_huge_page_node
 
 
 
-The closest OVS and DPDK upstream versions in Ericssons OVS and DPDK is the following: 
+The closest OVS and DPDK upstream versions in Ericsson's OVS and DPDK is the following: 
 
 DPDK version 2.2, last upstream commit seen from Ericsson DPDK is: 
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ 
@@ -1841,6 +1841,8 @@ user_destroy_device(struct vhost_device_ctx ctx)
 
 
 
+lib/librte_vhost/vhost_user/virtio-net-user.c
+
 static void
 free_mem_region(struct virtio_net *dev)
 {
@@ -1950,5 +1952,270 @@ KernelPageSize:  1048576 kB
 MMUPageSize:     1048576 kB
 Locked:                0 kB
 VmFlags: rd wr sh mr mw me ms de ht sd
+
+
+
+
+
+vi Ericsson_OVS_post_migration/daemon.log
+
+ VHOST_CONFIG: read message VHOST_USER_SET_MEM_TABLE, 0
+ VHOST_CONFIG: mapped region 0 fd:251 to:0x7fee40000000 sz:0x800000000 off:0xc0000000 align:0x40000000
+ VHOST_CONFIG: mapped region 1 fd:252 to:0x7fee00000000 sz:0x40000000 off:0x0 align:0x40000000
+ VHOST_CONFIG: mapped region 2 fd:253 to:0x7fed40000000 sz:0xc0000000 off:0xc0000 align:0x40000000
+
+
+
+
+
+./lib/librte_vhost/vhost_user/vhost-net-user.c
+
+/* callback when there is message on the connfd */
+static void
+vserver_message_handler(int connfd, void *dat, int *remove)
+{
+        struct vhost_device_ctx ctx;
+        struct connfd_ctx *cfd_ctx = (struct connfd_ctx *)dat;
+        struct VhostUserMsg msg;
+        uint64_t features;
+        int ret;
+
+        ctx.fh = cfd_ctx->fh;
+        ret = read_vhost_message(connfd, &msg);
+        if (ret <= 0 || msg.request >= VHOST_USER_MAX) {
+                if (ret < 0)
+                        RTE_LOG(ERR, VHOST_CONFIG,
+                                "vhost read message failed\n");
+                else if (ret == 0)
+                        RTE_LOG(INFO, VHOST_CONFIG,
+                                "vhost peer closed\n");
+                else
+                        RTE_LOG(ERR, VHOST_CONFIG,
+                                "vhost read incorrect message\n");
+
+                close(connfd);
+                *remove = 1;
+                free(cfd_ctx);
+                user_destroy_device(ctx);
+                ops->destroy_device(ctx);
+
+                return;
+        }
+
+        RTE_LOG(INFO, VHOST_CONFIG, "read message %s\n",
+                vhost_message_str[msg.request]);
+        switch (msg.request) {
+        case VHOST_USER_GET_FEATURES:
+                ret = ops->get_features(ctx, &features);
+                msg.payload.u64 = features;
+                msg.size = sizeof(msg.payload.u64);
+                send_vhost_message(connfd, &msg);
+                break;
+        case VHOST_USER_SET_FEATURES:
+                features = msg.payload.u64;
+                ops->set_features(ctx, &features);
+                break;
+
+        case VHOST_USER_GET_PROTOCOL_FEATURES:
+                msg.payload.u64 = VHOST_USER_PROTOCOL_FEATURES;
+                msg.size = sizeof(msg.payload.u64);
+                send_vhost_message(connfd, &msg);
+                break;
+        case VHOST_USER_SET_PROTOCOL_FEATURES:
+                user_set_protocol_features(ctx, msg.payload.u64);
+                break;
+
+        case VHOST_USER_SET_OWNER:
+                ops->set_owner(ctx);
+                break;
+
+        case VHOST_USER_RESET_OWNER:
+                ops->reset_owner(ctx);
+                break;
+
+        case VHOST_USER_SET_MEM_TABLE:
+                user_set_mem_table(ctx, &msg);           ---------------->  user_set_mem_table
+                break;
+
+        case VHOST_USER_SET_LOG_BASE:
+                RTE_LOG(INFO, VHOST_CONFIG, "not implemented.\n");
+                break;
+
+        case VHOST_USER_SET_LOG_FD:
+                close(msg.fds[0]);
+                RTE_LOG(INFO, VHOST_CONFIG, "not implemented.\n");
+                break;
+
+        case VHOST_USER_SET_VRING_NUM:
+                ops->set_vring_num(ctx, &msg.payload.state);
+                break;
+        case VHOST_USER_SET_VRING_ADDR:
+                ops->set_vring_addr(ctx, &msg.payload.addr);
+                break;
+        case VHOST_USER_SET_VRING_BASE:
+                ops->set_vring_base(ctx, &msg.payload.state);
+                break;
+
+        case VHOST_USER_GET_VRING_BASE:
+                ret = user_get_vring_base(ctx, &msg.payload.state);
+                msg.size = sizeof(msg.payload.state);
+                send_vhost_message(connfd, &msg);
+                break;
+
+        case VHOST_USER_SET_VRING_KICK:
+                user_set_vring_kick(ctx, &msg);
+                break;
+        case VHOST_USER_SET_VRING_CALL:
+                user_set_vring_call(ctx, &msg);
+                break;
+
+        case VHOST_USER_SET_VRING_ERR:
+                if (!(msg.payload.u64 & VHOST_USER_VRING_NOFD_MASK))
+                        close(msg.fds[0]);
+                RTE_LOG(INFO, VHOST_CONFIG, "not implemented\n");
+                break;
+
+        case VHOST_USER_GET_QUEUE_NUM:
+                msg.payload.u64 = VHOST_MAX_QUEUE_PAIRS;
+                msg.size = sizeof(msg.payload.u64);
+                send_vhost_message(connfd, &msg);
+                break;
+
+        case VHOST_USER_SET_VRING_ENABLE:
+                user_set_vring_enable(ctx, &msg.payload.state);
+                break;
+
+        default:
+                break;
+
+        }
+}
+
+------------------------------------------------------------------------------------
+
+./lib/librte_vhost/vhost_user/virtio-net-user.c
+
+int
+user_set_mem_table(struct vhost_device_ctx ctx, struct VhostUserMsg *pmsg)
+{
+        struct VhostUserMemory memory = pmsg->payload.memory;
+        struct virtio_memory_regions *pregion;
+        uint64_t mapped_address, mapped_size;
+        struct virtio_net *dev;
+        unsigned int idx = 0;
+        struct orig_region_map *pregion_orig;
+        uint64_t alignment;
+
+        /* unmap old memory regions one by one*/
+        dev = get_device(ctx);
+        if (dev == NULL)
+                return -1;
+
+        /* Remove from the data plane. */
+        if (dev->flags & VIRTIO_DEV_RUNNING)
+                notify_ops->destroy_device(dev);
+
+        if (dev->mem) {
+                free_mem_region(dev);
+                free(dev->mem);
+                dev->mem = NULL;
+        }
+
+        dev->mem = calloc(1,
+                sizeof(struct virtio_memory) +
+                sizeof(struct virtio_memory_regions) * memory.nregions +
+                sizeof(struct orig_region_map) * memory.nregions);
+        if (dev->mem == NULL) {
+                RTE_LOG(ERR, VHOST_CONFIG,
+                        "(%"PRIu64") Failed to allocate memory for dev->mem\n",
+                        dev->device_fh);
+                return -1;
+        }
+        dev->mem->nregions = memory.nregions;
+
+        pregion_orig = orig_region(dev->mem, memory.nregions);
+        for (idx = 0; idx < memory.nregions; idx++) {
+                pregion = &dev->mem->regions[idx];
+                pregion->guest_phys_address =
+                        memory.regions[idx].guest_phys_addr;
+                pregion->guest_phys_address_end =
+                        memory.regions[idx].guest_phys_addr +
+                        memory.regions[idx].memory_size;
+                pregion->memory_size =
+                        memory.regions[idx].memory_size;
+                pregion->userspace_address =
+                        memory.regions[idx].userspace_addr;
+
+                /* This is ugly */
+                mapped_size = memory.regions[idx].memory_size +
+                        memory.regions[idx].mmap_offset;
+
+                /* mmap() without flag of MAP_ANONYMOUS, should be called
+                 * with length argument aligned with hugepagesz at older
+                 * longterm version Linux, like 2.6.32 and 3.2.72, or
+                 * mmap() will fail with EINVAL.
+                 *
+                 * to avoid failure, make sure in caller to keep length
+                 * aligned.
+                 */
+                alignment = get_blk_size(pmsg->fds[idx]);
+                mapped_size = RTE_ALIGN_CEIL(mapped_size, alignment);
+
+                mapped_address = (uint64_t)(uintptr_t)mmap(NULL,
+                        mapped_size,
+                        PROT_READ | PROT_WRITE, MAP_SHARED,
+                        pmsg->fds[idx],
+                        0);
+
+                RTE_LOG(INFO, VHOST_CONFIG,
+                        "mapped region %d fd:%d to:%p sz:0x%"PRIx64" "
+                        "off:0x%"PRIx64" align:0x%"PRIx64"\n",
+                        idx, pmsg->fds[idx], (void *)(uintptr_t)mapped_address,
+                        mapped_size, memory.regions[idx].mmap_offset,
+                        alignment);
+
+                if (mapped_address == (uint64_t)(uintptr_t)MAP_FAILED) {
+                        RTE_LOG(ERR, VHOST_CONFIG,
+                                "mmap qemu guest failed.\n");
+                        goto err_mmap;
+                }
+
+                pregion_orig[idx].mapped_address = mapped_address;
+                pregion_orig[idx].mapped_size = mapped_size;
+                pregion_orig[idx].blksz = alignment;
+                pregion_orig[idx].fd = pmsg->fds[idx];
+
+                mapped_address +=  memory.regions[idx].mmap_offset;
+
+                pregion->address_offset = mapped_address -
+                        pregion->guest_phys_address;
+
+                if (memory.regions[idx].guest_phys_addr == 0) {
+                        dev->mem->base_address =
+                                memory.regions[idx].userspace_addr;
+                        dev->mem->mapped_address =
+                                pregion->address_offset;
+                }
+
+                LOG_DEBUG(VHOST_CONFIG,
+                        "REGION: %u GPA: %p QEMU VA: %p SIZE (%"PRIu64")\n",
+                        idx,
+                        (void *)(uintptr_t)pregion->guest_phys_address,
+                        (void *)(uintptr_t)pregion->userspace_address,
+                         pregion->memory_size);
+        }
+
+        return 0;
+
+err_mmap:
+        while (idx--) {
+                munmap((void *)(uintptr_t)pregion_orig[idx].mapped_address,
+                                pregion_orig[idx].mapped_size);
+                close(pregion_orig[idx].fd);
+        }
+        free(dev->mem);
+        dev->mem = NULL;
+        return -1;
+}
 
 
