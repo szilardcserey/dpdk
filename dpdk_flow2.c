@@ -1955,6 +1955,8 @@ VmFlags: rd wr sh mr mw me ms de ht sd
 
 
 
+########################################################################################################################
+
 
 
 vi Ericsson_OVS_post_migration/daemon.log
@@ -1964,9 +1966,1052 @@ vi Ericsson_OVS_post_migration/daemon.log
  VHOST_CONFIG: mapped region 1 fd:252 to:0x7fee00000000 sz:0x40000000 off:0x0 align:0x40000000
  VHOST_CONFIG: mapped region 2 fd:253 to:0x7fed40000000 sz:0xc0000000 off:0xc0000 align:0x40000000
 
+------------------------------------------------------------------------------------
+
+./lib/librte_vhost/vhost_user/vhost-net-user.c:479
+
+/**
+ * Creates and initialise the vhost server.
+ */
+int
+rte_vhost_driver_register(const char *path)
+{
+        struct vhost_server *vserver;
+
+        pthread_mutex_lock(&g_vhost_server.server_mutex);
+        if (ops == NULL)
+                ops = get_virtio_net_callbacks();
+
+        if (g_vhost_server.vserver_cnt == MAX_VHOST_SERVER) {
+                RTE_LOG(ERR, VHOST_CONFIG,
+                        "error: the number of servers reaches maximum\n");
+                pthread_mutex_unlock(&g_vhost_server.server_mutex);
+                return -1;
+        }
+
+        vserver = calloc(sizeof(struct vhost_server), 1);
+        if (vserver == NULL) {
+                pthread_mutex_unlock(&g_vhost_server.server_mutex);
+                return -1;
+        }
+
+        vserver->listenfd = uds_socket(path);
+        if (vserver->listenfd < 0) {
+                free(vserver);
+                pthread_mutex_unlock(&g_vhost_server.server_mutex);
+                return -1;
+        }
+
+        vserver->path = strdup(path);
+
+        fdset_add(&g_vhost_server.fdset, vserver->listenfd,
+                vserver_new_vq_conn, NULL, vserver);      ------------------>  vserver_new_vq_conn
+
+        g_vhost_server.server[g_vhost_server.vserver_cnt++] = vserver;
+        pthread_mutex_unlock(&g_vhost_server.server_mutex);
+
+        return 0;
+}
 
 
 
+==============================================================================================
+http://dpdk.org/doc/guides/prog_guide/glossary.html
+
+RTE - Run Time Environment. Provides a fast and simple framework for fast packet processing, in a lightweight environment as a Linux* application and using Poll Mode Drivers (PMDs) to increase speed.
+
+
+
+./doc/guides/prog_guide/vhost_lib.rst:54
+
+
+*   Vhost session start
+
+      rte_vhost_driver_session_start starts the vhost session loop.
+      Vhost session is an infinite blocking loop.
+      Put the session in a dedicate DPDK thread.
+
+
+./doc/guides/prog_guide/vhost_lib.rst
+
+*   Vhost driver registration
+
+      rte_vhost_driver_register registers the vhost driver into the system.
+      For vhost-cuse, character device file will be created under the /dev directory.
+      Character device name is specified as the parameter.
+      For vhost-user, a Unix domain socket server will be created with the parameter as
+      the local socket path.
+
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+./lib/librte_vhost/rte_vhost_version.map
+
+DPDK_2.0 {
+        global:
+
+        rte_vhost_dequeue_burst;
+        rte_vhost_driver_callback_register;
+        rte_vhost_driver_register;         ------------> rte_vhost_driver_register
+        rte_vhost_driver_session_start;       --------------> rte_vhost_driver_session_start
+        rte_vhost_enable_guest_notification;
+        rte_vhost_enqueue_burst;
+        rte_vhost_feature_disable;
+        rte_vhost_feature_enable;
+        rte_vhost_feature_get;
+
+        local: *;
+};
+
+DPDK_2.1 {
+        global:
+
+        rte_vhost_driver_unregister;
+
+} DPDK_2.0;
+
+         
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+ovs/lib/netdev-dpdk.c
+static char *vhost_sock_dir = NULL;   /* Location of vhost-user sockets */
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+ovs/lib/netdev-dpdk.c
+
+
+int
+dpdk_init(int argc, char **argv)
+{
+    int result;
+    int base = 0;
+    char *pragram_name = argv[0];
+
+    if (argc < 2 || strcmp(argv[1], "--dpdk"))
+        return 0;
+
+    /* Remove the --dpdk argument from arg list.*/
+    argc--;
+    argv++;
+
+    /* Reject --user option */
+    int i;
+    for (i = 0; i < argc; i++) {
+        if (!strcmp(argv[i], "--user")) {
+            VLOG_ERR("Can not mix --dpdk and --user options, aborting.");
+        }
+    }
+
+#ifdef VHOST_CUSE
+    if (process_vhost_flags("-cuse_dev_name", strdup("vhost-net"),
+                            PATH_MAX, argv, &cuse_dev_name)) {
+#else
+    if (process_vhost_flags("-vhost_sock_dir", strdup(ovs_rundir()),         -------> process_vhost_flags
+                            NAME_MAX, argv, &vhost_sock_dir)) {          
+        struct stat s;
+        int err;
+
+        err = stat(vhost_sock_dir, &s);
+        if (err) {
+            VLOG_ERR("vHostUser socket DIR '%s' does not exist.",
+                     vhost_sock_dir);
+            return err;
+        }
+#endif
+        /* Remove the vhost flag configuration parameters from the argument
+         * list, so that the correct elements are passed to the DPDK
+         * initialization function
+         */
+        argc -= 2;
+        argv += 2;    /* Increment by two to bypass the vhost flag arguments */
+        base = 2;
+    }
+
+    /* Keep the program name argument as this is needed for call to
+     * rte_eal_init()
+     */
+    argv[0] = pragram_name;
+
+    /* Make sure things are initialized ... */
+    result = rte_eal_init(argc, argv);
+    if (result < 0) {
+        ovs_abort(result, "Cannot init EAL");
+    }
+
+    rte_memzone_dump(stdout);
+    rte_eal_init_ret = 0;
+
+    if (argc > result) {
+        argv[result] = argv[0];
+    }
+
+    /* We are called from the main thread here */
+    RTE_PER_LCORE(_lcore_id) = NON_PMD_CORE_ID;
+
+    return result + 1 + base;
+}
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+./var/log/upstart/openvswitch-switch.log
+No -vhost_sock_dir provided - defaulting to /var/run/openvswitch
+
+
+qemu-system-x86_64 -enable-kvm -name instance-00000522 -S -machine pc-i440fx-xenial,accel=kvm,usb=off -cpu host -m 32768 -realtime mlock=off -smp 8,sockets=4,cores=1,threads=2 -object memory-backend-file,id=ram-node0,prealloc=yes,mem-path=/mnt/huge_qemu_1G/libvirt/qemu,share=yes,size=34359738368,host-nodes=0,policy=bind -numa node,nodeid=0,cpus=0-7,memdev=ram-node0 -uuid bdc81ffb-ca45-46ee-9d41-3d2c3f4840a3 -smbios type=1,manufacturer=OpenStack Foundation,product=OpenStack Nova,version=13.0.0,serial=4c4c4544-0042-4b10-8058-c8c04f5a4732,uuid=bdc81ffb-ca45-46ee-9d41-3d2c3f4840a3,family=Virtual Machine -no-user-config -nodefaults -chardev socket,id=charmonitor,path=/var/lib/libvirt/qemu/domain-instance-00000522/monitor.sock,server,nowait -mon chardev=charmonitor,id=monitor,mode=control -rtc base=utc,driftfix=slew -global kvm-pit.lost_tick_policy=discard -no-hpet -no-shutdown -boot strict=on -device piix3-usb-uhci,id=usb,bus=pci.0,addr=0x1.0x2 -drive file=/var/lib/nova/instances/bdc81ffb-ca45-46ee-9d41-3d2c3f4840a3/disk,format=qcow2,if=none,id=drive-virtio-disk0,cache=directsync -device virtio-blk-pci,scsi=off,bus=pci.0,addr=0x4,drive=drive-virtio-disk0,id=virtio-disk0,bootindex=1 
+
+-chardev socket,id=charnet0,path=/var/run/openvswitch/vhue0fdfafa-c7 
+-netdev type=vhost-user,id=hostnet0,chardev=charnet0 
+-device virtio-net-pci,netdev=hostnet0,id=net0,mac=fa:16:3e:08:c3:8d,bus=pci.0,addr=0x3 
+
+-chardev file,id=charserial0,path=/var/lib/nova/instances/bdc81ffb-ca45-46ee-9d41-3d2c3f4840a3/console.log -device isa-serial,chardev=charserial0,id=serial0 -chardev pty,id=charserial1 -device isa-serial,chardev=charserial1,id=serial1 -device usb-tablet,id=input0 -vnc 160.6.88.55:0 -k en-us -device cirrus-vga,id=video0,bus=pci.0,addr=0x2 -device i6300esb,id=watchdog0,bus=pci.0,addr=0x6 -watchdog-action reset -device virtio-balloon-pci,id=balloon0,bus=pci.0,addr=0x5 -msg timestamp=on
+
+
+
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+./lib/netdev-dpdk.c
+
+
+static int
+process_vhost_flags(char *flag, char *default_val, int size,
+                    char **argv, char **new_val)
+{
+    int changed = 0;
+
+    /* Depending on which version of vhost is in use, process the vhost-specific
+     * flag if it is provided on the vswitchd command line, otherwise resort to
+     * a default value.
+     *
+     * For vhost-user: Process "-vhost_sock_dir" to set the custom location of
+     * the vhost-user socket(s).
+     * For vhost-cuse: Process "-cuse_dev_name" to set the custom name of the
+     * vhost-cuse character device.
+     */
+    if (!strcmp(argv[1], flag) && (strlen(argv[2]) <= size)) {
+        changed = 1;
+        *new_val = strdup(argv[2]);
+        VLOG_INFO("User-provided %s in use: %s", flag, *new_val);
+    } else {
+        VLOG_INFO("No %s provided - defaulting to %s", flag, default_val);  ----------> defaulting to /var/run/openvswitch
+        *new_val = default_val;
+    }
+
+    return changed;
+}
+
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+./sos_commands/openvswitch/ovs-vsctl_-t_5_show:69:                type: dpdkvhostuser
+
+    Bridge br-int
+
+        Port "vhue0fdfafa-c7"
+            tag: 1
+            Interface "vhue0fdfafa-c7"
+                type: dpdkvhostuser
+
+
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ovs/lib/netdev-dpdk.c
+
+static const struct netdev_class OVS_UNUSED dpdk_vhost_user_class =
+    NETDEV_DPDK_CLASS(
+        "dpdkvhostuser",
+        dpdk_vhost_user_class_init,
+        netdev_dpdk_vhost_user_construct,
+        netdev_dpdk_vhost_destruct,
+        netdev_dpdk_vhost_set_multiq,
+        netdev_dpdk_vhost_send,
+        netdev_dpdk_vhost_get_carrier,
+        netdev_dpdk_vhost_get_stats,
+        NULL,
+        NULL,
+        netdev_dpdk_vhost_rxq_recv);
+
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+./lib/netdev-dpdk.c:2250
+
+#define NETDEV_DPDK_CLASS(NAME, INIT, CONSTRUCT, DESTRUCT, MULTIQ, SEND, \
+    GET_CARRIER, GET_STATS, GET_FEATURES, GET_STATUS, RXQ_RECV)          \
+{                                                             \
+    NAME,                                                     \
+    INIT,                       /* init */                    \
+    NULL,                       /* netdev_dpdk_run */         \
+    NULL,                       /* netdev_dpdk_wait */        \
+                                                              \
+    netdev_dpdk_alloc,                                        \
+    CONSTRUCT,                                                \
+    DESTRUCT,                                                 \
+    netdev_dpdk_dealloc,                                      \
+    netdev_dpdk_get_config,                                   \
+    NULL,                       /* netdev_dpdk_set_config */  \
+    NULL,                       /* get_tunnel_config */       \
+    NULL,                       /* build header */            \
+    NULL,                       /* push header */             \
+    NULL,                       /* pop header */              \
+    netdev_dpdk_get_numa_id,    /* get_numa_id */             \
+    MULTIQ,                     /* set_multiq */              \
+                                                              \
+    SEND,                       /* send */                    \
+    NULL,                       /* send_wait */               \
+                                                              \
+    netdev_dpdk_set_etheraddr,                                \
+    netdev_dpdk_get_etheraddr,                                \
+    netdev_dpdk_get_mtu,                                      \
+    netdev_dpdk_set_mtu,                                      \
+    netdev_dpdk_get_ifindex,                                  \
+    GET_CARRIER,                                              \
+    netdev_dpdk_get_carrier_resets,                           \
+    netdev_dpdk_set_miimon,                                   \
+    GET_STATS,                                                \
+    GET_FEATURES,                                             \
+    NULL,                       /* set_advertisements */      \
+                                                              \
+    NULL,                       /* set_policing */            \
+    NULL,                       /* get_qos_types */           \
+    NULL,                       /* get_qos_capabilities */    \
+    NULL,                       /* get_qos */                 \
+    NULL,                       /* set_qos */                 \
+    NULL,                       /* get_queue */               \
+    NULL,                       /* set_queue */               \
+    NULL,                       /* delete_queue */            \
+    NULL,                       /* get_queue_stats */         \
+    NULL,                       /* queue_dump_start */        \
+    NULL,                       /* queue_dump_next */         \
+    NULL,                       /* queue_dump_done */         \
+    NULL,                       /* dump_queue_stats */        \
+                                                              \
+    NULL,                       /* get_in4 */                 \
+    NULL,                       /* set_in4 */                 \
+    NULL,                       /* get_in6 */                 \
+    NULL,                       /* add_router */              \
+    NULL,                       /* get_next_hop */            \
+    GET_STATUS,                                               \
+    NULL,                       /* arp_lookup */              \
+                                                              \
+    netdev_dpdk_update_flags,                                 \
+                                                              \
+    netdev_dpdk_rxq_alloc,                                    \
+    netdev_dpdk_rxq_construct,                                \
+    netdev_dpdk_rxq_destruct,                                 \
+    netdev_dpdk_rxq_dealloc,                                  \
+    RXQ_RECV,                                                 \
+    NULL,                       /* rx_wait */                 \
+    NULL,                       /* rxq_drain */               \
+}
+
+
+
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+ovs/lib/netdev-dpdk.c
+
+
+static int
+netdev_dpdk_vhost_user_construct(struct netdev *netdev_)
+{
+    struct netdev_dpdk *netdev = netdev_dpdk_cast(netdev_);       <---------
+    const char *name = netdev_->name;
+    int err;
+
+    /* 'name' is appended to 'vhost_sock_dir' and used to create a socket in
+     * the file system. '/' or '\' would traverse directories, so they're not
+     * acceptable in 'name'. */
+    if (strchr(name, '/') || strchr(name, '\\')) {
+        VLOG_ERR("\"%s\" is not a valid name for a vhost-user port. "
+                 "A valid name must not include '/' or '\\'",
+                 name);
+        return EINVAL;
+    }
+
+    ovs_mutex_lock(&dpdk_mutex);
+    /* Take the name of the vhost-user port and append it to the location where
+     * the socket is to be created, then register the socket.
+     */
+    snprintf(netdev->vhost_id, sizeof(netdev->vhost_id), "%s/%s",
+             vhost_sock_dir, name);
+
+    err = rte_vhost_driver_register(netdev->vhost_id);         --------------->  rte_vhost_driver_register
+    if (err) {
+        VLOG_ERR("vhost-user socket device setup failure for socket %s\n",
+                 netdev->vhost_id);
+    } else {
+        fatal_signal_add_file_to_unlink(netdev->vhost_id);
+        VLOG_INFO("Socket %s created for vhost-user port %s\n",
+                  netdev->vhost_id, name);
+        err = vhost_construct_helper(netdev_);
+    }
+
+    ovs_mutex_unlock(&dpdk_mutex);
+    return err;
+}
+
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+./lib/netdev-dpdk.c
+
+static struct netdev_dpdk *
+netdev_dpdk_cast(const struct netdev *netdev)
+{
+    return CONTAINER_OF(netdev, struct netdev_dpdk, up);
+}
+
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+./lib/util.h:207
+
+
+/* Given POINTER, the address of the given MEMBER in a STRUCT object, returns
+   the STRUCT object. */
+#define CONTAINER_OF(POINTER, STRUCT, MEMBER)                           \
+        ((STRUCT *) (void *) ((char *) (POINTER) - offsetof (STRUCT, MEMBER)))
+
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+./lib/netdev-provider.h
+
+/* A network device (e.g. an Ethernet device).
+ *
+ * Network device implementations may read these members but should not modify
+ * them. */
+struct netdev {
+    /* The following do not change during the lifetime of a struct netdev. */
+    char *name;                         /* Name of network device. */      -------->  name
+    const struct netdev_class *netdev_class; /* Functions to control
+                                                this device. */
+
+    /* A sequence number which indicates changes in one of 'netdev''s
+     * properties.   It must be nonzero so that users have a value which
+     * they may use as a reset when tracking 'netdev'.
+     *
+     * Minimally, the sequence number is required to change whenever
+     * 'netdev''s flags, features, ethernet address, or carrier changes. */
+    uint64_t change_seq;
+
+    /* The following are protected by 'netdev_mutex' (internal to netdev.c). */
+    int n_txq;
+    int n_rxq;
+    int ref_cnt;                        /* Times this devices was opened. */
+    struct shash_node *node;            /* Pointer to element in global map. */
+    struct ovs_list saved_flags_list; /* Contains "struct netdev_saved_flags". */
+};
+
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+./lib/netdev-dpdk.c
+
+struct netdev_dpdk {
+    struct netdev up;
+    int port_id;
+    int max_packet_len;
+    enum dpdk_dev_type type;
+
+    struct dpdk_tx_queue *tx_q;
+
+    struct ovs_mutex mutex OVS_ACQ_AFTER(dpdk_mutex);
+
+    struct dpdk_mp *dpdk_mp;
+    int mtu;
+    int socket_id;
+    int buf_size;
+    struct netdev_stats stats;
+    /* Protects stats */
+    rte_spinlock_t stats_lock;
+
+    struct eth_addr hwaddr;
+    enum netdev_flags flags;
+
+    struct rte_eth_link link;
+    int link_reset_cnt;
+
+    /* The user might request more txqs than the NIC has.  We remap those
+     * ('up.n_txq') on these ('real_n_txq').
+     * If the numbers match, 'txq_needs_locking' is false, otherwise it is
+     * true and we will take a spinlock on transmission */
+    int real_n_txq;
+    int real_n_rxq;
+    bool txq_needs_locking;
+
+    /* virtio-net structure for vhost device */
+    OVSRCU_TYPE(struct virtio_net *) virtio_dev;
+
+    /* Identifier used to distinguish vhost devices from each other */
+    char vhost_id[PATH_MAX];
+
+    /* In dpdk_list. */
+    struct ovs_list list_node OVS_GUARDED_BY(dpdk_mutex);
+};
+
+
+
+
+
+
+
+##################################################################################################
+=========================================== DPDK =================================================
+
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+https://linux.die.net/man/3/pthread_mutex_init
+the macro PTHREAD_MUTEX_INITIALIZER can be used to initialize mutexes that are statically allocated. 
+
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+./lib/librte_vhost/vhost_user/vhost-net-user.c
+
+
+static struct _vhost_server g_vhost_server = {
+        .fdset = {
+                .fd = { [0 ... MAX_FDS - 1] = {-1, NULL, NULL, NULL, 0} },
+                .fd_mutex = PTHREAD_MUTEX_INITIALIZER,
+                .num = 0
+        },
+        .vserver_cnt = 0,
+        .server_mutex = PTHREAD_MUTEX_INITIALIZER,
+};
+
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+OVS
+
+ovs/lib/netdev-dpdk.c
+
+static int
+netdev_dpdk_vhost_user_construct(struct netdev *netdev_)
+{
+    struct netdev_dpdk *netdev = netdev_dpdk_cast(netdev_);
+    const char *name = netdev_->name;
+    int err;
+
+    /* 'name' is appended to 'vhost_sock_dir' and used to create a socket in
+     * the file system. '/' or '\' would traverse directories, so they're not
+     * acceptable in 'name'. */
+    if (strchr(name, '/') || strchr(name, '\\')) {
+        VLOG_ERR("\"%s\" is not a valid name for a vhost-user port. "
+                 "A valid name must not include '/' or '\\'",
+                 name);
+        return EINVAL;
+    }
+
+    ovs_mutex_lock(&dpdk_mutex);
+    /* Take the name of the vhost-user port and append it to the location where
+     * the socket is to be created, then register the socket.
+     */
+    snprintf(netdev->vhost_id, sizeof(netdev->vhost_id), "%s/%s",
+             vhost_sock_dir, name);
+
+    err = rte_vhost_driver_register(netdev->vhost_id);
+    if (err) {
+        VLOG_ERR("vhost-user socket device setup failure for socket %s\n",
+                 netdev->vhost_id);
+    } else {
+        fatal_signal_add_file_to_unlink(netdev->vhost_id);
+        VLOG_INFO("Socket %s created for vhost-user port %s\n",
+                  netdev->vhost_id, name);
+        err = vhost_construct_helper(netdev_);
+    }
+
+    ovs_mutex_unlock(&dpdk_mutex);
+    return err;
+}
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+DPDK
+
+
+./lib/librte_vhost/vhost_user/vhost-net-user.c
+
+/**
+ * Create a unix domain socket, bind to path and listen for connection.
+ * @return
+ *  socket fd or -1 on failure
+ */
+static int
+uds_socket(const char *path)
+{
+        struct sockaddr_un un;
+        int sockfd;
+        int ret;
+
+        if (path == NULL)
+                return -1;
+
+        sockfd = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (sockfd < 0)
+                return -1;
+        RTE_LOG(INFO, VHOST_CONFIG, "socket created, fd:%d\n", sockfd);
+
+        memset(&un, 0, sizeof(un));
+        un.sun_family = AF_UNIX;
+        snprintf(un.sun_path, sizeof(un.sun_path), "%s", path);
+        ret = bind(sockfd, (struct sockaddr *)&un, sizeof(un));
+        if (ret == -1) {
+                RTE_LOG(ERR, VHOST_CONFIG, "fail to bind fd:%d, remove file:%s and try again.\n",
+                        sockfd, path);
+                goto err;
+        }
+        RTE_LOG(INFO, VHOST_CONFIG, "bind to %s\n", path);
+
+        ret = listen(sockfd, MAX_VIRTIO_BACKLOG);
+        if (ret == -1)
+                goto err;
+
+        return sockfd;
+
+err:
+        close(sockfd);
+        return -1;
+}
+
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+./lib/librte_vhost/vhost_user/vhost-net-user.h
+
+struct vhost_server {
+        char *path; /**< The path the uds is bind to. */
+        int listenfd;     /**< The listener sockfd. */
+};
+
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+./lib/librte_vhost/vhost_user/vhost-net-user.c:478
+
+
+/**
+ * Creates and initialise the vhost server.
+ */
+int
+rte_vhost_driver_register(const char *path)
+{
+        struct vhost_server *vserver;
+
+        pthread_mutex_lock(&g_vhost_server.server_mutex);
+        if (ops == NULL)
+                ops = get_virtio_net_callbacks();
+
+        if (g_vhost_server.vserver_cnt == MAX_VHOST_SERVER) {
+                RTE_LOG(ERR, VHOST_CONFIG,
+                        "error: the number of servers reaches maximum\n");
+                pthread_mutex_unlock(&g_vhost_server.server_mutex);
+                return -1;
+        }
+
+        vserver = calloc(sizeof(struct vhost_server), 1);
+        if (vserver == NULL) {
+                pthread_mutex_unlock(&g_vhost_server.server_mutex);
+                return -1;
+        }
+
+        vserver->listenfd = uds_socket(path);         ------------>  uds_socket  create unix socket
+        if (vserver->listenfd < 0) {                                   path: /var/run/openvswitch/vhue0fdfafa-c7
+                free(vserver);
+                pthread_mutex_unlock(&g_vhost_server.server_mutex);
+                return -1;
+        }
+
+        vserver->path = strdup(path);
+
+        fdset_add(&g_vhost_server.fdset, vserver->listenfd,         -----------> fdset_add
+                vserver_new_vq_conn, NULL, vserver);                            adds rcb  vserver_new_vq_conn
+
+        g_vhost_server.server[g_vhost_server.vserver_cnt++] = vserver;
+        pthread_mutex_unlock(&g_vhost_server.server_mutex);
+
+        return 0;
+}
+
+
+
+
+fdset_add(struct fdset *pfdset, int fd, fd_cb rcb, fd_cb wcb, void *dat)
+
+fdset_add(&g_vhost_server.fdset, vserver->listenfd, vserver_new_vq_conn, NULL, vserver);  
+
+rcb => vserver_new_vq_conn
+
+/* call back when there is new virtio connection.  */
+static void vserver_new_vq_conn(int fd, void *dat, __rte_unused int *remove)
+
+
+
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+./lib/librte_vhost/vhost_user/fd_man.h
+
+#define MAX_FDS 1024
+
+struct fdset {
+        struct fdentry fd[MAX_FDS];
+        pthread_mutex_t fd_mutex;
+        int num;        /* current fd number of this fdset */
+};
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+./lib/librte_vhost/vhost_user/fd_man.h
+
+struct fdentry {
+        int fd;         /* -1 indicates this entry is empty */
+        fd_cb rcb;      /* callback when this fd is readable. */
+        fd_cb wcb;      /* callback when this fd is writeable.*/
+        void *dat;      /* fd context */
+        int busy;       /* whether this entry is being used in cb. */
+};
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+./lib/librte_vhost/vhost_user/fd_man.c
+
+/**
+ * Register the fd in the fdset with read/write handler and context.
+ */
+int
+fdset_add(struct fdset *pfdset, int fd, fd_cb rcb, fd_cb wcb, void *dat)
+{
+        int i;
+
+        if (pfdset == NULL || fd == -1)
+                return -1;
+
+        pthread_mutex_lock(&pfdset->fd_mutex);
+
+        /* Find a free slot in the list. */
+        i = fdset_find_free_slot(pfdset);
+        if (i == -1) {
+                pthread_mutex_unlock(&pfdset->fd_mutex);
+                return -2;
+        }
+
+        fdset_add_fd(pfdset, i, fd, rcb, wcb, dat);
+        pfdset->num++;
+
+        pthread_mutex_unlock(&pfdset->fd_mutex);
+
+        return 0;
+}
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+./lib/librte_vhost/vhost_user/fd_man.c
+
+static void
+fdset_add_fd(struct fdset  *pfdset, int idx, int fd,
+        fd_cb rcb, fd_cb wcb, void *dat)
+{
+        struct fdentry *pfdentry;
+
+        if (pfdset == NULL || idx >= MAX_FDS)
+                return;
+
+        pfdentry = &pfdset->fd[idx];
+        pfdentry->fd = fd;
+        pfdentry->rcb = rcb;
+        pfdentry->wcb = wcb;
+        pfdentry->dat = dat;
+}
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+##############################################################################################
+
+OVS
+
+vi ./ovs/lib/netdev-dpdk.c
+
+static void *
+start_vhost_loop(void *dummy OVS_UNUSED)
+{
+     pthread_detach(pthread_self());
+     /* Put the cuse thread into quiescent state. */
+     ovsrcu_quiesce_start();
+     rte_vhost_driver_session_start();
+     return NULL;
+}
+
+
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+DPDK
+
+dpdk/lib/librte_vhost/vhost_user/vhost-net-user.c
+
+int
+rte_vhost_driver_session_start(void)
+{
+        fdset_event_dispatch(&g_vhost_server.fdset);      --------->   fdset_event_dispatch
+        return 0;
+}
+
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+./lib/librte_vhost/vhost_user/fd_man.h
+
+#define MAX_FDS 1024
+
+struct fdset {
+        struct fdentry fd[MAX_FDS];
+        pthread_mutex_t fd_mutex;
+        int num;        /* current fd number of this fdset */
+};
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+./lib/librte_vhost/vhost_user/fd_man.h
+
+struct fdentry {
+        int fd;         /* -1 indicates this entry is empty */
+        fd_cb rcb;      /* callback when this fd is readable. */
+        fd_cb wcb;      /* callback when this fd is writeable.*/
+        void *dat;      /* fd context */
+        int busy;       /* whether this entry is being used in cb. */
+};
+
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+lib/librte_vhost/vhost_user/fd_man.c
+
+/**
+ * This functions runs in infinite blocking loop until there is no fd in
+ * pfdset. It calls corresponding r/w handler if there is event on the fd.
+ *
+ * Before the callback is called, we set the flag to busy status; If other
+ * thread(now rte_vhost_driver_unregister) calls fdset_del concurrently, it
+ * will wait until the flag is reset to zero(which indicates the callback is
+ * finished), then it could free the context after fdset_del.
+ */
+void
+fdset_event_dispatch(struct fdset *pfdset)
+{
+        fd_set rfds, wfds;
+        int i, maxfds;
+        struct fdentry *pfdentry;   // pointer file descriptor entry
+        int num = MAX_FDS;
+        fd_cb rcb, wcb;           // rcb - read call back  wcb - write call back     fd_cb - file descriptor call back
+        void *dat;
+        int fd;
+        int remove1, remove2;
+        int ret;
+
+        if (pfdset == NULL)
+                return;
+
+        while (1) {
+                struct timeval tv;
+                tv.tv_sec = 1;
+                tv.tv_usec = 0;
+                FD_ZERO(&rfds);        // read file descriptors
+                FD_ZERO(&wfds);        // write file descriptors
+                pthread_mutex_lock(&pfdset->fd_mutex);
+
+                maxfds = fdset_fill(&rfds, &wfds, pfdset);
+
+                pthread_mutex_unlock(&pfdset->fd_mutex);
+
+                /*
+                 * When select is blocked, other threads might unregister
+                 * listenfds from and register new listenfds into fdset.
+                 * When select returns, the entries for listenfds in the fdset
+                 * might have been updated. It is ok if there is unwanted call
+                 * for new listenfds.
+                 */
+                ret = select(maxfds + 1, &rfds, &wfds, NULL, &tv);         // tv - timeval
+                if (ret <= 0)
+                        continue;
+
+                for (i = 0; i < num; i++) {
+                        remove1 = remove2 = 0;
+                        pthread_mutex_lock(&pfdset->fd_mutex);
+                        pfdentry = &pfdset->fd[i];
+                        fd = pfdentry->fd;
+                        rcb = pfdentry->rcb;
+                        wcb = pfdentry->wcb;
+                        dat = pfdentry->dat;
+                        pfdentry->busy = 1;
+                        pthread_mutex_unlock(&pfdset->fd_mutex);
+                        if (fd >= 0 && FD_ISSET(fd, &rfds) && rcb)
+                                rcb(fd, dat, &remove1);
+                        if (fd >= 0 && FD_ISSET(fd, &wfds) && wcb)
+                                wcb(fd, dat, &remove2);
+                        pfdentry->busy = 0;
+                        /*
+                         * fdset_del needs to check busy flag.
+                         * We don't allow fdset_del to be called in callback
+                         * directly.
+                         */
+                        /*
+                         * When we are to clean up the fd from fdset,
+                         * because the fd is closed in the cb,
+                         * the old fd val could be reused by when creates new
+                         * listen fd in another thread, we couldn't call
+                         * fd_set_del.
+                         */
+                        if (remove1 || remove2)
+                                fdset_del_slot(pfdset, i);
+                }
+        }
+
+}
+
+
+
+fdset_add(struct fdset *pfdset, int fd, fd_cb rcb, fd_cb wcb, void *dat)
+
+fdset_add(&g_vhost_server.fdset, conn_fd, vserver_message_handler, NULL, ctx); 
+
+rcb => vserver_message_handler
+
+
+/* callback when there is message on the connfd */
+static void vserver_message_handler(int connfd, void *dat, int *remove)
+
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+https://linux.die.net/man/3/fd_set
+
+select() and pselect() allow a program to monitor multiple file descriptors, waiting until one or more of the file descriptors become "ready" for some class of I/O operation (e.g., input possible). A file descriptor is considered ready if it is possible to perform the corresponding I/O operation (e.g., read(2)) without blocking.
+
+int select(int nfds, fd_set *readfds, fd_set *writefds,
+           fd_set *exceptfds, struct timeval *timeout);
+
+
+FD_ISSET() tests to see if a file descriptor is part of the set; this is useful after select() returns.
+
+select() uses a timeout that is a struct timeval (with seconds and microseconds
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+./lib/librte_vhost/vhost_user/fd_man.c
+
+/**
+ * Register the fd in the fdset with read/write handler and context.
+ */
+int
+fdset_add(struct fdset *pfdset, int fd, fd_cb rcb, fd_cb wcb, void *dat)
+{
+        int i;
+
+        if (pfdset == NULL || fd == -1)
+                return -1;
+
+        pthread_mutex_lock(&pfdset->fd_mutex);
+
+        /* Find a free slot in the list. */
+        i = fdset_find_free_slot(pfdset);
+        if (i == -1) {
+                pthread_mutex_unlock(&pfdset->fd_mutex);
+                return -2;
+        }
+
+        fdset_add_fd(pfdset, i, fd, rcb, wcb, dat);
+        pfdset->num++;
+
+        pthread_mutex_unlock(&pfdset->fd_mutex);
+
+        return 0;
+}
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+./lib/librte_vhost/vhost_user/fd_man.c
+
+static void
+fdset_add_fd(struct fdset  *pfdset, int idx, int fd,
+        fd_cb rcb, fd_cb wcb, void *dat)
+{
+        struct fdentry *pfdentry;
+
+        if (pfdset == NULL || idx >= MAX_FDS)
+                return;
+
+        pfdentry = &pfdset->fd[idx];
+        pfdentry->fd = fd;
+        pfdentry->rcb = rcb;
+        pfdentry->wcb = wcb;
+        pfdentry->dat = dat;
+}
+
+
+
+==============================================================================================
+
+
+
+------------------------------------------------------------------------------------
+
+./lib/librte_vhost/vhost_user/vhost-net-user.c:321
+
+/* call back when there is new virtio connection.  */
+static void
+vserver_new_vq_conn(int fd, void *dat, __rte_unused int *remove)
+{
+        struct vhost_server *vserver = (struct vhost_server *)dat;
+        int conn_fd;
+        struct connfd_ctx *ctx;
+        int fh;
+        struct vhost_device_ctx vdev_ctx = { (pid_t)0, 0 };
+        unsigned int size;
+
+        conn_fd = accept(fd, NULL, NULL);
+        RTE_LOG(INFO, VHOST_CONFIG,
+                "new virtio connection is %d\n", conn_fd);
+        if (conn_fd < 0)
+                return;
+
+        ctx = calloc(1, sizeof(*ctx));
+        if (ctx == NULL) {
+                close(conn_fd);
+                return;
+        }
+
+        fh = ops->new_device(vdev_ctx);
+        if (fh == -1) {
+                free(ctx);
+                close(conn_fd);
+                return;
+        }
+
+        vdev_ctx.fh = fh;
+        size = strnlen(vserver->path, PATH_MAX);
+        ops->set_ifname(vdev_ctx, vserver->path,
+                size);
+
+        RTE_LOG(INFO, VHOST_CONFIG, "new device, handle is %d\n", fh);
+
+        ctx->vserver = vserver;
+        ctx->fh = fh;
+        fdset_add(&g_vhost_server.fdset,
+                conn_fd, vserver_message_handler, NULL, ctx);         ---------------> vserver_message_handler
+}
+
+
+
+------------------------------------------------------------------------------------
 
 ./lib/librte_vhost/vhost_user/vhost-net-user.c
 
@@ -2107,7 +3152,7 @@ user_set_mem_table(struct vhost_device_ctx ctx, struct VhostUserMsg *pmsg)
         uint64_t alignment;
 
         /* unmap old memory regions one by one*/
-        dev = get_device(ctx);
+        dev = get_device(ctx);         ----------> returns struct virtio_net 
         if (dev == NULL)
                 return -1;
 
@@ -2218,4 +3263,29 @@ err_mmap:
         return -1;
 }
 
+
+------------------------------------------------------------------------------------
+
+
+./lib/librte_vhost/vhost_user/virtio-net-user.c *dev)
+
+
+static void
+free_mem_region(struct virtio_net *dev)
+{
+        struct orig_region_map *region;
+        unsigned int idx;
+
+        if (!dev || !dev->mem)
+                return;
+
+        region = orig_region(dev->mem, dev->mem->nregions);
+        for (idx = 0; idx < dev->mem->nregions; idx++) {
+                if (region[idx].mapped_address) {
+                        munmap((void *)(uintptr_t)region[idx].mapped_address,
+                                        region[idx].mapped_size);
+                        close(region[idx].fd);
+                }
+        }
+}
 
